@@ -71,57 +71,65 @@ static unsigned int nested = 0;
  * a process event message to the next subscriber, or resume handling the
  * event itself if there are no more subscribers to notify.
  */
-static void
-resume_event(struct mproc * rmp)
+static void resume_event(struct mproc *rmp)
 {
-	message m;
-	unsigned int event;
+    message m;
+    unsigned int i;
+    unsigned int event;
+    int r;
 
-	assert(rmp->mp_flags & IN_USE);
-	assert(rmp->mp_flags & EVENT_CALL);
-	assert(rmp->mp_eventsub != NO_EVENTSUB);
+    if ((rmp->mp_flags & IN_USE) == 0) {
+        return;
+    }
+    if ((rmp->mp_flags & EVENT_CALL) == 0) {
+        return;
+    }
+    if (rmp->mp_eventsub == NO_EVENTSUB) {
+        return;
+    }
 
-	if (rmp->mp_flags & EXITING) {
-		event = PROC_EVENT_EXIT;
-	} else if (rmp->mp_flags & UNPAUSED) {
-		event = PROC_EVENT_SIGNAL;
-	} else {
-		panic("unknown event for flags %x", rmp->mp_flags);
-	}
+    if ((rmp->mp_flags & EXITING) != 0) {
+        event = PROC_EVENT_EXIT;
+    } else if ((rmp->mp_flags & UNPAUSED) != 0) {
+        event = PROC_EVENT_SIGNAL;
+    } else {
+        panic("unknown event for flags %x", rmp->mp_flags);
+        return;
+    }
 
-	for (unsigned int i = rmp->mp_eventsub; i < nsubs; i++) {
-		if (subs[i].mask & event) {
-			memset(&m, 0, sizeof(m));
-			m.m_type = PROC_EVENT;
-			m.m_pm_lsys_proc_event.endpt = rmp->mp_endpoint;
-			m.m_pm_lsys_proc_event.event = event;
+    for (i = rmp->mp_eventsub; i < nsubs; i++) {
+        if ((subs[i].mask & event) == 0) {
+            continue;
+        }
 
-			const int r = asynsend3(subs[i].endpt, &m, AMF_NOREPLY);
-			if (r != OK) {
-				panic("asynsend failed: %d", r);
-			}
+        memset(&m, 0, sizeof(m));
+        m.m_type = PROC_EVENT;
+        m.m_pm_lsys_proc_event.endpt = rmp->mp_endpoint;
+        m.m_pm_lsys_proc_event.event = event;
 
-			assert(subs[i].waiting < NR_PROCS);
-			subs[i].waiting++;
+        r = asynsend3(subs[i].endpt, &m, AMF_NOREPLY);
+        if (r != OK) {
+            panic("asynsend failed: %d", r);
+            return;
+        }
 
-			rmp->mp_eventsub = i + 1;
-			return;
-		}
-	}
+        if (subs[i].waiting >= NR_PROCS) {
+            panic("waiting count overflow");
+            return;
+        }
+        subs[i].waiting++;
+        rmp->mp_eventsub = i + 1;
+        return;
+    }
 
-	rmp->mp_flags &= ~EVENT_CALL;
-	rmp->mp_eventsub = NO_EVENTSUB;
+    rmp->mp_flags &= ~EVENT_CALL;
+    rmp->mp_eventsub = NO_EVENTSUB;
 
-	switch (event) {
-	case PROC_EVENT_EXIT:
-		exit_restart(rmp);
-		break;
-	case PROC_EVENT_SIGNAL:
-		restart_sigs(rmp);
-		break;
-	default:
-		panic("unhandled event %u", event);
-	}
+    if (event == PROC_EVENT_EXIT) {
+        exit_restart(rmp);
+    } else if (event == PROC_EVENT_SIGNAL) {
+        restart_sigs(rmp);
+    }
 }
 
 /*
@@ -132,22 +140,26 @@ resume_event(struct mproc * rmp)
 static void
 remove_sub(unsigned int slot)
 {
-	assert(slot < nsubs);
+	struct mproc *rmp;
+	unsigned int i;
 
-	if (slot < nsubs - 1) {
-		memmove(&subs[slot], &subs[slot + 1],
-		    (nsubs - slot - 1) * sizeof(subs[0]));
+	if (slot >= nsubs) {
+		return;
+	}
+
+	for (i = slot; i < nsubs - 1; i++) {
+		subs[i] = subs[i + 1];
 	}
 	nsubs--;
 
-	const unsigned int required_flags = IN_USE | EVENT_CALL;
-
-	for (struct mproc *rmp = &mproc[0]; rmp < &mproc[NR_PROCS]; rmp++) {
-		if ((rmp->mp_flags & required_flags) != required_flags) {
+	for (rmp = &mproc[0]; rmp < &mproc[NR_PROCS]; rmp++) {
+		if ((rmp->mp_flags & (IN_USE | EVENT_CALL)) != (IN_USE | EVENT_CALL)) {
 			continue;
 		}
 
-		assert(rmp->mp_eventsub != NO_EVENTSUB);
+		if (rmp->mp_eventsub == NO_EVENTSUB) {
+			continue;
+		}
 
 		if ((unsigned int)rmp->mp_eventsub == slot) {
 			nested++;
@@ -169,32 +181,28 @@ remove_sub(unsigned int slot)
 int
 do_proceventmask(void)
 {
-	if (!(mp->mp_flags & PRIV_PROC)) {
+	unsigned int i, mask;
+
+	if (!(mp->mp_flags & PRIV_PROC))
 		return EPERM;
-	}
 
-	const unsigned int mask = m_in.m_lsys_pm_proceventmask.mask;
-	int sub_index = -1;
+	mask = m_in.m_lsys_pm_proceventmask.mask;
 
-	for (unsigned int i = 0; i < nsubs; i++) {
-		if (subs[i].endpt == who_e) {
-			sub_index = (int)i;
-			break;
+	for (i = 0; i < nsubs; i++) {
+		if (subs[i].endpt != who_e)
+			continue;
+		
+		if (mask == 0 && subs[i].waiting == 0) {
+			remove_sub(i);
+			return OK;
 		}
-	}
-
-	if (sub_index != -1) {
-		if (mask == 0 && subs[sub_index].waiting == 0) {
-			remove_sub(sub_index);
-		} else {
-			subs[sub_index].mask = mask;
-		}
+		
+		subs[i].mask = mask;
 		return OK;
 	}
 
-	if (mask == 0) {
+	if (mask == 0)
 		return OK;
-	}
 
 	if (nsubs >= __arraycount(subs)) {
 		printf("PM: too many process event subscribers!\n");
@@ -218,15 +226,13 @@ do_proc_event_reply(void)
 {
 	struct mproc *rmp;
 	endpoint_t endpt;
-	unsigned int i;
-	unsigned int expected_event;
+	unsigned int i, event;
 	int slot;
 
 	assert(nested == 0);
 
-	if (!(mp->mp_flags & PRIV_PROC)) {
+	if (!(mp->mp_flags & PRIV_PROC))
 		return ENOSYS;
-	}
 
 	endpt = m_in.m_pm_lsys_proc_event.endpt;
 	if (pm_isokendpt(endpt, &slot) != OK) {
@@ -236,19 +242,22 @@ do_proc_event_reply(void)
 	}
 
 	rmp = &mproc[slot];
+	
 	if (!(rmp->mp_flags & EVENT_CALL)) {
 		printf("PM: proc event reply from %d for endpt %d, no event\n",
 		    who_e, endpt);
 		return SUSPEND;
 	}
 
-	i = rmp->mp_eventsub;
-	if (rmp->mp_eventsub == NO_EVENTSUB || i >= nsubs) {
-		printf("PM: proc event reply from %d for endpt %d, bad sub index %u\n",
-		    who_e, endpt, i);
+	if (rmp->mp_eventsub == NO_EVENTSUB ||
+	    (unsigned int)rmp->mp_eventsub >= nsubs) {
+		printf("PM: proc event reply from %d for endpt %d index %d\n",
+		    who_e, endpt, rmp->mp_eventsub);
 		return SUSPEND;
 	}
 
+	i = rmp->mp_eventsub;
+	
 	if (subs[i].endpt != who_e) {
 		printf("PM: proc event reply for %d from %d instead of %d\n",
 		    endpt, who_e, subs[i].endpt);
@@ -256,19 +265,19 @@ do_proc_event_reply(void)
 	}
 
 	if (rmp->mp_flags & EXITING) {
-		expected_event = PROC_EVENT_EXIT;
+		event = PROC_EVENT_EXIT;
 	} else if (rmp->mp_flags & UNPAUSED) {
-		expected_event = PROC_EVENT_SIGNAL;
+		event = PROC_EVENT_SIGNAL;
 	} else {
 		printf("PM: proc event reply from %d for %d, bad flags %x\n",
 		    who_e, endpt, rmp->mp_flags);
 		return SUSPEND;
 	}
 
-	if (m_in.m_pm_lsys_proc_event.event != expected_event) {
-		printf("PM: proc event reply from %d for %d for event %u "
-		    "instead of %u\n", who_e, endpt,
-		    m_in.m_pm_lsys_proc_event.event, expected_event);
+	if (m_in.m_pm_lsys_proc_event.event != event) {
+		printf("PM: proc event reply from %d for %d for event %d "
+		    "instead of %d\n", who_e, endpt,
+		    m_in.m_pm_lsys_proc_event.event, event);
 		return SUSPEND;
 	}
 
@@ -290,37 +299,25 @@ do_proc_event_reply(void)
  * from the process flags.  In addition, if the event is a process exit, also
  * check if it is a subscribing service that died.
  */
-static void
-cleanup_exiting_subscriber(const struct mproc * rmp)
+void publish_event(struct mproc *rmp)
 {
-	for (unsigned int i = 0; i < nsubs; i++) {
-		if (subs[i].endpt == rmp->mp_endpoint) {
-			remove_sub(i);
-			return;
-		}
-	}
-}
+    unsigned int i;
 
-void
-publish_event(struct mproc * rmp)
-{
-	if (rmp == NULL) {
-		return;
-	}
+    assert(nested == 0);
+    assert((rmp->mp_flags & (IN_USE | EVENT_CALL)) == IN_USE);
+    assert(rmp->mp_eventsub == NO_EVENTSUB);
 
-	assert(nested == 0);
-	assert((rmp->mp_flags & (IN_USE | EVENT_CALL)) == IN_USE);
-	assert(rmp->mp_eventsub == NO_EVENTSUB);
+    if ((rmp->mp_flags & (PRIV_PROC | EXITING)) == (PRIV_PROC | EXITING)) {
+        for (i = 0; i < nsubs; i++) {
+            if (subs[i].endpt == rmp->mp_endpoint) {
+                remove_sub(i);
+                break;
+            }
+        }
+    }
 
-	const int is_exiting_service =
-	    (rmp->mp_flags & (PRIV_PROC | EXITING)) == (PRIV_PROC | EXITING);
+    rmp->mp_flags |= EVENT_CALL;
+    rmp->mp_eventsub = 0;
 
-	if (is_exiting_service) {
-		cleanup_exiting_subscriber(rmp);
-	}
-
-	rmp->mp_flags |= EVENT_CALL;
-	rmp->mp_eventsub = 0;
-
-	resume_event(rmp);
+    resume_event(rmp);
 }
